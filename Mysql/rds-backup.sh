@@ -7,6 +7,11 @@ threads=${THREADS:-8}
 chunk_mb=${CHUNK_FILESIZE_MB:-128}
 long_query_ms=${LONG_QUERY_MS:-7200000}
 rows=${ROWS:-50000}
+# 是否包含 events（由 -E 选项控制），默认 0：不备份 events
+include_events=0
+# 屏蔽的数据库列表（用|分隔），可通过环境变量 EXCLUDED_DATABASES 覆盖
+# 默认屏蔽系统库及常见内部库
+excluded_databases=${EXCLUDED_DATABASES:-"mysql|information_schema|INFORMATION_SCHEMA|performance_schema|PERFORMANCE_SCHEMA|sys|metrics_schema|METRICS_SCHEMA|__recycle_bin__"}
 
 # 命令行参数：-h host -P port -u user -p password -D days -K keep -T threads -F chunk_mb -L long_query_ms [--rows rows] -H help
 usage() {
@@ -25,12 +30,14 @@ usage() {
   echo "  -L <long_query_ms>        mydumper -l（毫秒），默认 ${long_query_ms}"
   echo "  -D <retention_days>       留存天数（>0 生效），默认 ${RETENTION_DAYS:-2}"
   echo "  -K <retention_keep>       留存最近 N 份（>0 生效），默认 ${RETENTION_KEEP:-0}"
+  echo "  -E                         导出 events（默认不导出）"
   echo "  -H                         显示帮助"
   echo ""
   echo "提示: --rows 与 -F 可同时使用；将任一值设为 0 可禁用对应选项"
+  echo "环境变量: EXCLUDED_DATABASES 设置屏蔽的数据库（用|分隔），默认: ${excluded_databases}"
 }
 
-while getopts ":h:P:u:p:D:K:T:F:L:H" opt; do
+while getopts ":h:P:u:p:D:K:T:F:L:HE" opt; do
   case "$opt" in
     h) host="$OPTARG" ;;
     P) port="$OPTARG" ;;
@@ -41,6 +48,7 @@ while getopts ":h:P:u:p:D:K:T:F:L:H" opt; do
     T) threads="$OPTARG" ;;
     F) chunk_mb="$OPTARG" ;;
     L) long_query_ms="$OPTARG" ;;
+    E) include_events=1 ;;
     H) usage; exit 0 ;;
     :) echo "Option -$OPTARG requires an argument."; usage; exit 1 ;;
     \?) echo "Invalid option: -$OPTARG"; usage; exit 1 ;;
@@ -75,7 +83,9 @@ print_effective_config() {
   echo "  host=${host} port=${port} user=${user}"
   echo "  threads=${threads} long_query_ms=${long_query_ms}"
   echo "  chunk_mb=${chunk_mb} rows=${rows}"
+  echo "  excluded_databases=${excluded_databases}"
   echo "  retention_days=${RETENTION_DAYS:-2} retention_keep=${RETENTION_KEEP:-0}"
+  echo "  include_events=${include_events}"
   echo "  output_dir=${bakdir}"
 }
 
@@ -105,6 +115,21 @@ print_effective_config
 command -v mydumper >/dev/null 2>&1 || { echo "FATAL: 未找到 mydumper"; exit 127; }
 command -v mysql >/dev/null 2>&1 || { echo "FATAL: 未找到 mysql 客户端"; exit 127; }
 
+# === 单独备份卡表: diary_linping.sys_vis_log ===
+special_table="diary_linping.sys_vis_log"
+special_bakdir="/rds-backup/${host}/$(date +%Y%m%d_%H%M%S)_sysvislog_$(date +%N)"
+echo "==> 检测到特殊表: ${special_table}，将单独备份 (threads=1)"
+
+mkdir -p "${special_bakdir}"
+
+mydumper -h "${host}" -u "${user}" -P "${port}" -p "${passwd}" \
+  -B diary_linping -T "${special_table}" \
+  -o "${special_bakdir}" --threads 1 -v 3 --compress --trx-tables -l "${long_query_ms}"
+if [ $? -eq 0 ]; then
+  echo "==> 特殊表 ${special_table} 备份成功"
+else
+  echo "==> 特殊表 ${special_table} 备份失败，继续备份其他表"
+fi
 
 # 使用 MYSQL_PWD 避免明文密码出现在进程参数中
 if [ -n "${passwd}" ]; then
@@ -114,15 +139,25 @@ fi
 
 
 # mydumper 参数：不加表锁，降低锁强度；一致性基于 InnoDB 快照
+# 使用负向前瞻基于 EXCLUDED_DATABASES 直接排除库（以及该库下所有表）
+# 正则解释：以库名开头，且该库名不在 excluded_databases 中（后面跟 . 或字符串结束）
+regex_exclude="^((?!^(${excluded_databases})(\\.|$))(?!^diary_linping\\.sys_vis_log$)).*"
+
 cmd=(
   mydumper
   -h "${host}"
   -u "${user}"
   -P "${port}"
-  -G -R -E 
-  -x '^(?!(mysql|INFORMATION_SCHEMA|PERFORMANCE_SCHEMA|METRICS_SCHEMA))'
+  -G -R
+  # 使用 --regex 直接进行排除匹配
+  --regex "${regex_exclude}"
   -t "${threads}"
 )
+
+# 根据 include_events 是否追加 -E
+if [ "${include_events}" = "1" ]; then
+  cmd+=( -E )
+fi
 
 # 分片/切块参数：两者可并行使用
 if is_positive_int "${rows}"; then
@@ -140,6 +175,7 @@ cmd+=(
   -o "${bakdir}"
 )
 
+echo "正则(排除): ${regex_exclude}"
 echo "执行命令: ${cmd[*]}"
 start_ts=$(date +%s)
 if "${cmd[@]}"; then
@@ -178,3 +214,4 @@ fi
 
 echo "结束时间: $(date -Is)"
 exit ${status}
+
